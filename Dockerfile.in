@@ -1,0 +1,5 @@
+FROM alpine:3.7
+ADD ./bin/linux/cmd /bin/certificate-init-container
+RUN chmod ugo+x /bin/certificate-init-container
+USER nobody
+CMD [ "certificate-init-container" ]
