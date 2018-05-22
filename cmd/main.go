@@ -25,11 +25,14 @@ import (
 	"os"
 	"time"
 
-	"k8s.io/api/certificates/v1beta1"
+	cert "k8s.io/api/certificates/v1beta1"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+
+	api "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1beta1"
+	extended "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset"
 )
 
 var (
@@ -57,45 +60,17 @@ func main() {
 	}
 	clientset, err := kubernetes.NewForConfig(cfg)
 
+	deployAPIRegistration(cfg)
+
 	// Lets load up the secret and see if we even need to refresh/obtain a new certificate
 	secret, err := clientset.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
 	if err == nil && secret != nil {
 		privateKey := secret.Data["server.key"]
 		publicKey := secret.Data["server.crt"]
 
-		parsedCert, err := tls.X509KeyPair(publicKey, privateKey)
-		if err != nil {
-			println("Error with the current cert: %s", err)
-		} else {
-			// ensure pub/private key match
-			if parsedCert.Leaf != nil {
-				println("Parsing not succesful. parsedCert.Leaf!=nil")
-			} else {
-				block, _ := pem.Decode(publicKey)
-				cert, err := x509.ParseCertificate(block.Bytes)
-				if err != nil {
-					log.Println("failed to parse certificate: " + err.Error())
-				}
-				roots := x509.NewCertPool()
-				content, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
-				if err != nil {
-					log.Println("Cant open CA file %s", err)
-				}
-
-				roots.AppendCertsFromPEM(content)
-				opts := x509.VerifyOptions{
-					DNSName: serviceDomainName(serviceName, namespace, clusterDomain)[0],
-					Roots:   roots,
-				}
-
-				if _, err := cert.Verify(opts); err != nil {
-					log.Println("failed to verify certificate: " + err.Error())
-				} else {
-					log.Println("Certificate is still valid. No need to refresh")
-					os.Exit(0)
-				}
-
-			}
+		if verifyCertPair(publicKey, privateKey) {
+			log.Println("Certificate is still valid. No need to refresh")
+			os.Exit(0)
 		}
 
 	} else {
@@ -135,6 +110,10 @@ func main() {
 		log.Fatalf("unable to generate the certificate request: %s", err)
 	}
 
+	csr, err := clientset.CertificatesV1beta1().CertificateSigningRequests().Get(certificateSigningRequestName, metav1.GetOptions{})
+	if csr != nil && err == nil {
+		log.Fatalf("error retrieving certificate signing request: %s", err)
+	}
 	log.Println("Delete old CSR")
 	deletePolicy := metav1.DeletePropagationForeground
 
@@ -144,30 +123,29 @@ func main() {
 	log.Println("Deleted")
 	certificateRequestBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: certificateRequest})
 	log.Println("Create CSR")
-	csr, err := clientset.CertificatesV1beta1().CertificateSigningRequests().Create(&v1beta1.CertificateSigningRequest{
+	csr, err = clientset.CertificatesV1beta1().CertificateSigningRequests().Create(&cert.CertificateSigningRequest{
 
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      certificateSigningRequestName,
 			Namespace: namespace,
 		},
-		Spec: v1beta1.CertificateSigningRequestSpec{
+		Spec: cert.CertificateSigningRequestSpec{
 			Groups:  []string{"system:authenticated", "system:serviceaccounts", "system:serviceaccounts:" + namespace},
 			Request: certificateRequestBytes,
-			Usages: []v1beta1.KeyUsage{
-				v1beta1.UsageDigitalSignature,
-				v1beta1.UsageKeyEncipherment,
-				v1beta1.UsageServerAuth,
-				v1beta1.UsageClientAuth},
+			Usages: []cert.KeyUsage{
+				cert.UsageDigitalSignature,
+				cert.UsageKeyEncipherment,
+				cert.UsageServerAuth,
+				cert.UsageClientAuth},
 		},
 	})
 	if err != nil {
 		log.Fatalf("unable to create the certificate signing request: %s", err)
 	}
 	log.Println("Approve CSR")
-	time.Sleep(5 * time.Second)
 
-	condition := v1beta1.CertificateSigningRequestCondition{
-		Type:    v1beta1.CertificateApproved,
+	condition := cert.CertificateSigningRequestCondition{
+		Type:    cert.CertificateApproved,
 		Reason:  "AutoApproved",
 		Message: "Auto approving of all kubelet CSRs is enabled on bootkube",
 	}
@@ -176,31 +154,22 @@ func main() {
 	if err != nil {
 		log.Fatalf("unable to approve certificate signing request: %s", err)
 	}
+
+	// We need to pause in order to let the controller sign the cert and update the CSR status
 	time.Sleep(5 * time.Second)
 
 	// Refresh status with cert now in it
 	csr, err = clientset.CertificatesV1beta1().CertificateSigningRequests().Get(certificateSigningRequestName, metav1.GetOptions{})
+	if err != nil {
+		log.Fatalf("error retrieving certificate signing request: %s", err)
+	}
 	log.Println("size returned %v", len(csr.Status.Certificate))
 
 	block, _ := pem.Decode(csr.Status.Certificate)
 	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		log.Println("failed to parse certificate: " + err.Error())
-	}
-	roots := x509.NewCertPool()
-	content, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
-	if err != nil {
-		log.Println("Cant open CA file %s", err)
-	}
-
-	roots.AppendCertsFromPEM(content)
-	opts := x509.VerifyOptions{
-		DNSName: serviceDomainName(serviceName, namespace, clusterDomain)[0],
-		Roots:   roots,
-	}
-
-	if _, err := cert.Verify(opts); err != nil {
-		log.Println("failed to verify certificate: " + err.Error())
+	if !verifyCertPair(cert.Raw, pemKeyBytes) {
+		log.Fatalf("Certificate pair provisioned is invalid!")
+		os.Exit(1)
 	}
 
 	secretSpec := v1.Secret{
@@ -211,14 +180,12 @@ func main() {
 		Data: map[string][]byte{"server.key": pemKeyBytes, "server.crt": csr.Status.Certificate},
 		Type: v1.SecretTypeOpaque,
 	}
-
 	secret, err = clientset.CoreV1().Secrets(namespace).Get(secretName, metav1.GetOptions{})
 	if err == nil && secret != nil {
 		secret, err = clientset.CoreV1().Secrets(namespace).Update(&secretSpec)
 		if err != nil {
 			log.Println("unable to update secret with certificate: %s", err)
 		}
-
 	} else {
 		secret, err = clientset.CoreV1().Secrets(namespace).Create(&secretSpec)
 		if err != nil {
@@ -236,6 +203,42 @@ func serviceDomainName(name, namespace, domain string) []string {
 	retObj = append(retObj, fmt.Sprintf("%s.%s.svc.%s", name, namespace, domain))
 	retObj = append(retObj, fmt.Sprintf("%s.%s.svc", name, namespace))
 	return retObj
+}
+
+func deployAPIRegistration(cfg *rest.Config) {
+
+	log.Println("Checking For Kube Registration")
+	extendset, err := extended.NewForConfig(cfg)
+	reg, err := extendset.ApiregistrationV1beta1().APIServices().Get("v1beta1.custom.metrics.k8s.io", metav1.GetOptions{})
+	if reg == nil && err == nil {
+		log.Println("Creating Kube API Registration")
+		reg, err = extendset.ApiregistrationV1beta1().APIServices().Create(&api.APIService{
+
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "v1beta1.custom.metrics.k8s.io",
+			},
+			Spec: api.APIServiceSpec{
+				Service: &api.ServiceReference{
+					Name:      serviceName,
+					Namespace: namespace,
+				},
+				Group:                 "custom.metrics.k8s.io",
+				Version:               "v1beta1",
+				InsecureSkipTLSVerify: false,
+				CABundle:              []byte(os.Getenv("CA_FILE")),
+				GroupPriorityMinimum:  100,
+				VersionPriority:       100,
+			},
+		})
+		if err != nil {
+			log.Println("Error creating registration %s", err)
+		}
+	} else if err != nil {
+		log.Println("Error while checking for registration %s", err)
+	} else {
+		log.Println("API Already exists")
+	}
+
 }
 
 // Verify if a keypair is valid for TLS

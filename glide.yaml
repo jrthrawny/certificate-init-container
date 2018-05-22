@@ -1,18 +1,16 @@
-package: github.com/coreos/kapprover
+package: certificate-init-container
 import:
 - package: github.com/Sirupsen/logrus
   version: ^0.11.2
 - package: k8s.io/apimachinery
-  subpackages:
-  - pkg/apis/meta/v1
-  - pkg/fields
+  version: release-1.10
 - package: k8s.io/client-go
-  version: v7.0.0
-  subpackages:
-  - kubernetes
-  - kubernetes/typed/certificates/v1beta1
-  - pkg/api/v1
-  - pkg/apis/certificates
-  - rest
-  - tools/cache
-  - tools/clientcmd
+
+- package: k8s.io/kube-aggregator
+  version: release-1.10
+
+- package: k8s.io/code-generator
+
+- package: k8s.io/gengo
+- package: github.com/spf13/cobra
+- package: github.com/spf13/pflag
